@@ -20,6 +20,9 @@ env:
   # Configurable via GitHub Repo Settings -> Variables (vars.KICBASE_REPO & vars.KICBASE_REGISTRY)
   KICBASE_REPO: ${{ inputs.repo || vars.KICBASE_REPO || 'docker.io/kicbase/build' }}
   KICBASE_REGISTRY: ${{ vars.KICBASE_REGISTRY || 'docker.io' }}
+  # Commit status reported on the PR head, like a prow job context.
+  STATUS_CONTEXT: kicbase/build
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 permissions:
   contents: read
@@ -37,9 +40,13 @@ jobs:
         )
       )
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      statuses: write
     outputs:
       kic_version: ${{ steps.prep.outputs.kic_version }}
-      head_sha: ${{ steps.prep.outputs.head_sha }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      failure_reason: ${{ steps.pr.outputs.failure_reason }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Verify comment author is in OWNERS
@@ -52,12 +59,71 @@ jobs:
             echo "User ${COMMENT_USER} is not in OWNERS reviewers or approvers" && exit 1
           fi
 
-      - name: Checkout repository and PR branch
-        id: pr
+      - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # Resolves the PR head from the API and pins the rest of the workflow to that exact
+      # commit. No code from the PR runs in this step, so it is the only step in this job
+      # that needs the token.
+      - name: Resolve and verify PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ inputs.pr_number || github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AT: ${{ github.event.comment.created_at }}
+        run: |
+          HEAD_SHA=$(gh pr view "${PR_NUM}" --json headRefOid --jq '.headRefOid')
+          PR_REPO=$(gh pr view "${PR_NUM}" --json headRepositoryOwner,headRepository --jq '.headRepositoryOwner.login + "/" + .headRepository.name')
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #${PR_NUM} head: ${HEAD_SHA} (${PR_REPO})"
+
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="${STATUS_CONTEXT}" -f target_url="${RUN_URL}" \
+            -f description="Building kicbase image..."
+
+          fail() {
+            echo "failure_reason=$1" >> "$GITHUB_OUTPUT"
+            echo "::error::$1"
+            exit 1
+          }
+
+          # The build runs code from the PR and pushes to the image registry, so make sure the
+          # commit being built is the one the approver looked at. PRs from minikube-bot's fork
+          # can only be pushed to by maintainers, so they are exempt.
+          if [ -n "${COMMENT_BODY}" ] && [ "${PR_REPO}" != "minikube-bot/minikube" ]; then
+            APPROVED_SHA=$(echo "${COMMENT_BODY}" | tr -d '\r' | awk '/ok-to-build-image/ {print $2; exit}')
+            if [ -n "${APPROVED_SHA}" ]; then
+              # Explicit pin: `ok-to-build-image <full-commit-sha>`
+              if [ "${HEAD_SHA}" != "${APPROVED_SHA}" ]; then
+                fail "PR head ${HEAD_SHA} does not match approved SHA ${APPROVED_SHA}"
+              fi
+            else
+              # No pin: the head must have been pushed before the approval comment was written,
+              # and the branch must not have been force pushed since. Both timestamps are set by
+              # GitHub, so the PR author cannot forge them.
+              LATE_FORCE_PUSH=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/events?per_page=100" \
+                --jq ".[] | select(.event == \"head_ref_force_pushed\" and .created_at > \"${COMMENT_AT}\") | .created_at" | head -n1)
+              if [ -n "${LATE_FORCE_PUSH}" ]; then
+                fail "PR was force pushed at ${LATE_FORCE_PUSH}, after the approval comment at ${COMMENT_AT}. Comment ok-to-build-image again to build the new head."
+              fi
+              # Every PR event (open, push, reopen) creates workflow runs for the head SHA at that moment.
+              LAST_PUSHED_AT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" \
+                --jq '[.workflow_runs[].created_at] | max // empty')
+              if [ -z "${LAST_PUSHED_AT}" ]; then
+                fail "Could not determine when ${HEAD_SHA} was pushed. Comment: ok-to-build-image ${HEAD_SHA}"
+              fi
+              if [ "${LAST_PUSHED_AT}" \> "${COMMENT_AT}" ]; then
+                fail "PR head ${HEAD_SHA} was pushed at ${LAST_PUSHED_AT}, after the approval comment at ${COMMENT_AT}. Comment ok-to-build-image again to build the new head."
+              fi
+            fi
+          fi
+
+          git fetch --no-tags origin "refs/pull/${PR_NUM}/head"
+          git checkout --detach "${HEAD_SHA}"
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v5
@@ -69,22 +135,11 @@ jobs:
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
 
-      - name: Prepare PR branch and build metadata
+      - name: Prepare build metadata
         id: prep
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUM: ${{ inputs.pr_number || github.event.issue.number }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          gh pr checkout "${PR_NUM}"
-          PR_REPO=$(gh pr view "${PR_NUM}" --json headRepositoryOwner,headRepository --jq '.headRepositoryOwner.login + "/" + .headRepository.name')
-          if [ -n "${COMMENT_BODY}" ] && [ "${PR_REPO}" != "minikube-bot/minikube" ]; then
-            APPROVED_SHA=$(echo "${COMMENT_BODY}" | tr -d '\r' | awk '/ok-to-build-image/ {print $2}')
-            if [ "$(git rev-parse HEAD)" != "${APPROVED_SHA}" ]; then
-              echo "PR HEAD ($(git rev-parse HEAD)) does not match approved SHA (${APPROVED_SHA:-<missing>}). Comment: ok-to-build-image <full-commit-sha>" && exit 1
-            fi
-          fi
-
           KV=$(grep -E "Version =" pkg/drivers/kic/types.go | cut -d \" -f 2 | cut -d "-" -f 1)
           KIC_VERSION="${KV}-$(date +%s)-${PR_NUM}"
 
@@ -94,7 +149,6 @@ jobs:
           echo "kic_version=${KIC_VERSION}" >> "$GITHUB_OUTPUT"
           echo "repo=${KICBASE_REPO}" >> "$GITHUB_OUTPUT"
           echo "image=${KICBASE_REPO}:${KIC_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           make -s KIC_VERSION="${KIC_VERSION}" --eval='print-kic-vars: ; @echo "version_json=$(VERSION_JSON)"; echo "commit_sha=$(VERSION)-$(COMMIT_NOQUOTES)"' print-kic-vars >> "$GITHUB_OUTPUT"
 
       - name: Log in to container registry
@@ -120,7 +174,7 @@ jobs:
     needs: build-kicbase
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository and PR branch
+      - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           fetch-depth: 0
@@ -132,20 +186,24 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
-      - name: Update PR with new kicbase image
+      - name: Checkout PR branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUM: ${{ inputs.pr_number || github.event.issue.number }}
           EXPECTED_SHA: ${{ needs.build-kicbase.outputs.head_sha }}
+        run: |
+          gh pr checkout "${PR_NUM}"
+          if [ "$(git rev-parse HEAD)" != "${EXPECTED_SHA}" ]; then
+            echo "::error::PR HEAD ($(git rev-parse HEAD)) changed during build (expected ${EXPECTED_SHA})" && exit 1
+          fi
+
+      - name: Update PR with new kicbase image
+        env:
           KIC_VERSION: ${{ needs.build-kicbase.outputs.kic_version }}
           REPO: ${{ env.KICBASE_REPO }}
           IMAGE: ${{ env.KICBASE_REPO }}:${{ needs.build-kicbase.outputs.kic_version }}
           SHA: ${{ needs.build-kicbase.outputs.digest }}
         run: |
-          gh pr checkout "${PR_NUM}"
-          if [ "$(git rev-parse HEAD)" != "${EXPECTED_SHA}" ]; then
-            echo "PR HEAD ($(git rev-parse HEAD)) changed during build (expected ${EXPECTED_SHA})" && exit 1
-          fi
           DIGEST="${SHA#sha256:}"
 
           sed -i "s|Version = .*|Version = \"${KIC_VERSION}\"|;s|baseImageSHA = .*|baseImageSHA = \"${DIGEST}\"|;s|gcrRepo = .*|gcrRepo = \"${REPO}\"|;s|dockerhubRepo = .*|dockerhubRepo = \"${REPO}\"|" pkg/drivers/kic/types.go
@@ -172,3 +230,39 @@ jobs:
             gh pr comment "${PR_NUM}" --body "Built \`${IMAGE}\` (\`sha256:${DIGEST}\`), but failed to push to the PR branch. Please run locally and push: \`sed -i 's|Version = .*|Version = \"${KIC_VERSION}\"|;s|baseImageSHA = .*|baseImageSHA = \"${DIGEST}\"|;s|gcrRepo = .*|gcrRepo = \"${REPO}\"|;s|dockerhubRepo = .*|dockerhubRepo = \"${REPO}\"|' pkg/drivers/kic/types.go && make generate-docs\`"
             exit 1
           fi
+
+  # Reports the final result on the PR head, replacing the pending status set at the start.
+  # Runs whenever a head was resolved, including when the build or update failed or was cancelled.
+  report-status:
+    needs: [build-kicbase, update-pr]
+    if: always() && needs.build-kicbase.outputs.head_sha != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      statuses: write
+    steps:
+      - name: Report commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.build-kicbase.outputs.head_sha }}
+          BUILD_RESULT: ${{ needs.build-kicbase.result }}
+          UPDATE_RESULT: ${{ needs.update-pr.result }}
+          FAILURE_REASON: ${{ needs.build-kicbase.outputs.failure_reason }}
+          IMAGE: ${{ env.KICBASE_REPO }}:${{ needs.build-kicbase.outputs.kic_version }}
+        run: |
+          if [ "${BUILD_RESULT}" = "success" ] && [ "${UPDATE_RESULT}" = "success" ]; then
+            STATE=success
+            DESCRIPTION="Built ${IMAGE} and updated the PR"
+          elif [ "${BUILD_RESULT}" = "cancelled" ] || [ "${UPDATE_RESULT}" = "cancelled" ]; then
+            STATE=error
+            DESCRIPTION="Build was cancelled"
+          elif [ "${BUILD_RESULT}" != "success" ]; then
+            STATE=failure
+            DESCRIPTION="${FAILURE_REASON:-Building the kicbase image failed}"
+          else
+            STATE=failure
+            DESCRIPTION="Built ${IMAGE} but failed to update the PR"
+          fi
+          # Status descriptions are limited to 140 characters.
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="${STATE}" -f context="${STATUS_CONTEXT}" -f target_url="${RUN_URL}" \
+            -f description="${DESCRIPTION:0:140}"
