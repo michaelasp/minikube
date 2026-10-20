@@ -24,10 +24,10 @@ import (
 
 const (
 	// Version is the current version of kic
-	Version = "v0.0.51-1792521791-4"
+	Version = "v0.0.51-1792523645-4"
 
 	// SHA of the kic base image
-	baseImageSHA = "d51bdda24da0520ea594d322701c622b4013e9fedd3146ae02fa175fbc0f6acd"
+	baseImageSHA = "43c31de2c324ce794425b990fd528c5040682190bb8cbc9aa47e5baa3b646f8c"
 	// The name of the GCR kicbase repository
 	gcrRepo = "docker.io/maspinwa/kicbase"
 	// The name of the Dockerhub kicbase repository
